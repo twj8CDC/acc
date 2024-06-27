@@ -1,0 +1,33 @@
+```{r}
+library(tidyverse)
+library(BART3)
+
+# read in the clean data
+df=tibble(read.csv("data_clean_2013.csv"))
+```
+
+```{r}
+df %>% glimpse
+xtrn = df %>% select(asthma_treated, sex, age, income, educ, race, insurance, married, region) %>% glimpse
+xtrn$educ = factor(xtrn$educ)
+xtrn$insurance = factor(xtrn$insurance)
+xtrn$region = factor(xtrn$region)
+xtrn$sex = factor(xtrn$sex)
+xtrn %>% glimpse
+
+
+ytrn = df$expend
+
+
+post = BART3::mc.gbart(data.frame(xtrn), ytrn)
+
+str(post$yhat.train)
+
+lapply(post$yhat.train, mean, 1)
+
+#xtrn %>% glimpse
+xtst_true = subset(xtrn, asthma_treated==1)
+xtst_true
+
+# xpend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region, 
+```
