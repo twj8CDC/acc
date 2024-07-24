@@ -1,0 +1,684 @@
+```{r}
+library(MEPS)
+library(dplyr)
+library(survey)
+library(twopartm)
+
+options(width = 400)
+
+library(origami)
+library(rsample)
+library(skimr)
+library(yardstick)
+library(BART)
+library(stringr)
+library(ranger)
+```
+
+```{r}
+data <- read.csv("meps_2012_clean.csv")
+data$nonzero_expend = as.factor(ifelse(data$expend > 0, 1,0))
+data %>% glimpse()
+
+# initial split
+init_split = rsample::initial_split(data, prop=3/4, strata = asthma_treated)
+train = rsample::training(init_split)
+test = rsample::testing(init_split)
+glimpse(train)
+skim(train$asthma_treated)
+skim(test$asthma_treated)
+
+# easier to prep bartdatasets up top
+cov_names = unlist(str_trim(unlist(str_split("asthma_treated+ sex + age + agesq + income + educ + race + insurance + married + region", "\\+"), "both")))
+cov_names
+cov = train #%>% select(all_of(cov_names))
+{
+  cov$asthma_treated = factor(cov$asthma_treated)
+  cov$sex = factor(cov$sex)
+  cov$educ = factor(cov$educ)
+  cov$race = factor(cov$race)
+  cov$insurance = factor(cov$insurance)
+  cov$married = factor(cov$married)
+  cov$region = factor(cov$region)
+}
+# train_bart = BART::bartModelMatrix(cov)
+train_bart = cov
+train_bart %>% glimpse
+cov = test #%>% select(all_of(cov_names))
+# {
+#   cov$asthma_treated = factor(cov$asthma_treated)
+#   cov$sex = factor(cov$sex)
+#   cov$educ = factor(cov$educ)
+#   cov$race = factor(cov$race)
+#   cov$insurance = factor(cov$insurance)
+#   cov$married = factor(cov$married)
+#   cov$region = factor(cov$region)
+# }
+# test_bart = BART::bartModelMatrix(cov)
+# test_bart %>% glimpse
+
+folds <- make_folds(train, fold_fun  = folds_vfold, V=5)
+```
+
+# tpm
+```{r}
+library(stringr)
+cv_tpm <- function(fold, data) {
+    # get name and index of outcome variable from regression formula
+	# out_var <- as.character(unlist(str_split(reg_form, " "))[1])
+	# out_var_ind <- as.numeric(which(colnames(data) == out_var))
+
+    # define training and validation sets based on input object of class "folds"
+    train_data <- origami::training(data)
+    valid_data <- origami::validation(data)
+
+    
+	# tpm core
+    mod <- tpm(
+        expend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region,
+        data = train_data,
+        link_part1 = "logit",
+        family_part2 = Gamma(link = "log"),
+        # weights=data$PERWTF
+    )
+	preds <- predict(mod, newdata = valid_data)
+    # valid_data <- as.data.frame(valid_data)
+
+    # define output object to be returned as list (for flexibility)
+    out <- list(
+        # coef = data.frame(mod$coefs),
+        # SE = ((preds - valid_data[, out_var_ind])^2) # square error
+		final = data.frame("truth" = valid_data$expend, "est" = preds)
+    )
+    # return(out)
+}
+
+# now, let's cross-validate...
+cvtpm_results <- cross_validate(
+  cv_fun = cv_tpm, 
+  folds = folds,
+  data = train, 
+#   reg_form = "expend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region",
+  use_future = FALSE
+)
+
+
+yardstick::rmse(cvtpm_results$final, "truth", "est")
+yardstick::rsq(cvtpm_results$final, "truth", "est")
+```
+
+# random forest
+```{r}
+cv_rf <- function(fold, data) {
+    # define training and validation sets based on input object of class "folds"
+    train_data <- origami::training(data)
+    valid_data <- origami::validation(data)
+
+    rf_part1 <- ranger(nonzero_expend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region,
+                   data = train_data, num.trees = 1500,
+				#    mtry=,
+                   probability = TRUE)
+
+	rf_part2 <- ranger(expend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region,
+					# mtry=10,
+                   	data = subset(train_data, nonzero_expend == 1), num.trees = 1500)
+
+	prob_nonzero <- predict(rf_part1, valid_data)$predictions[, 2]
+	pred_expend <- predict(rf_part2, valid_data)$predictions
+	predicted_y <- prob_nonzero * pred_expend
+
+    # define output object to be returned as list (for flexibility)
+    out <- list(
+		p1 = data.frame("truth" = valid_data$nonzero_expend, "est" = prob_nonzero),
+		final = data.frame("truth" = valid_data$expend, "est" = predicted_y)
+        # coef = data.frame(mod$coefs),
+        # SE = ((preds - valid_data[, out_var_ind])^2) # square error
+    )
+    # return(out)
+}
+
+
+# folds <- make_folds(train)
+cvtrf_results <- cross_validate(
+  cv_fun = cv_rf, 
+  folds = folds,
+  data = train, 
+  use_future = FALSE
+)
+cvtrf_results
+
+yardstick::roc_auc(cvtrf_results$p1, "truth", "est", event_level = "second")
+yardstick::pr_auc(cvtrf_results$p1, "truth", "est", event_level = "second")
+yardstick::rmse(cvtrf_results$final, "truth", "est")
+yardstick::rsq(cvtrf_results$final, "truth", "est")
+```
+
+```{r}
+library(BART)
+library(stringr)
+cv_bart <- function(fold, data, reg_form) {
+    cov_names = unlist(str_trim(unlist(str_split("asthma_treated+ sex + age + agesq + income + educ + race + insurance + married + region", "\\+"), "both")))
+    # define training and validation sets based on input object of class "folds"
+    train_data <- origami::training(data)
+    valid_data <- origami::validation(data)
+	# train_data = data[1:1000,]
+	# valid_data = data[1001:2000,]
+
+	x1_train = train_data %>% 
+		select(all_of(cov_names))
+	y1_train = as.integer(train_data$nonzero_expend) -1  # make as int
+	
+	x2_train = subset(x1_train, y1_train == 1)
+	y2_train = subset(as.data.frame(train_data)$expend, y1_train==1)
+	
+	x_valid = BART::bartModelMatrix(valid_data %>% 
+		select(all_of(cov_names)))
+	y1_valid = valid_data$nonzero_expend
+	y2_valid = valid_data$expend
+		
+	brt_p1 = BART::mc.pbart(
+ 		x.train = data.frame(x1_train),
+  		y.train = y1_train,
+  		mc.cores=7
+	)
+		
+	brt_p2 = BART::mc.wbart(
+		x.train = x2_train,
+		y.train = y2_train,
+		mc.cores=7
+	)
+	
+	# predict
+	pred1 = predict(brt_p1, x_valid)$prob.test.mean
+	pred2 = apply(predict(brt_p2, x_valid), 2, mean)
+	pred3 = pred1 * pred2
+
+
+    # define output object to be returned as list (for flexibility)
+    out <- list(
+		p1 = data.frame("truth" = valid_data$nonzero_expend, "est" = pred1),
+		final = data.frame("truth" = valid_data$expend, "est" = pred3)
+    )
+    
+}
+
+# str(brt_p1)
+# tmp = cv_bart(folds1, train_bart)
+# tmp 
+folds_1 <- make_folds(train, fold_fun  = folds_vfold, V=2)
+cvtbart_results <- cross_validate(
+  cv_fun = cv_bart, 
+  folds = folds,
+  data = train_bart, 
+  use_future = FALSE
+)
+# cvtbart_results$p1
+
+yardstick::roc_auc(cvtbart_results$p1, "truth", "est", event_level = "second")
+yardstick::pr_auc(cvtbart_results$p1, "truth", "est", event_level = "second")
+yardstick::rmse(cvtbart_results$final, "truth", "est")
+yardstick::rsq(cvtbart_results$final, "truth", "est")
+
+
+```
+
+```{r}
+cv_bart2 <- function(fold, data, reg_form) {
+    cov_names = unlist(str_trim(unlist(str_split("asthma_treated+ sex + age + agesq + income + educ + race + insurance + married + region", "\\+"), "both")))
+    # define training and validation sets based on input object of class "folds"
+    train_data <- origami::training(data)
+    valid_data <- origami::validation(data)
+	# train_data = data[1:1000,]
+	# valid_data = data[1001:2000,]
+
+	x1_train = train_data %>% 
+		select(all_of(cov_names))
+	y1_train = train_data$expend  # make as int
+	# y1_train = as.integer(train_data$nonzero_expend) -1  # make as int
+	
+	# x2_train = subset(x1_train, y1_train == 1)
+	# y2_train = subset(as.data.frame(train_data)$expend, y1_train==1)
+	
+	x_valid = BART::bartModelMatrix(valid_data %>% 
+		select(all_of(cov_names)))
+	# y1_valid = valid_data$nonzero_expend
+	y2_valid = valid_data$expend
+		
+	# brt_p1 = BART::mc.pbart(
+ 		# x.train = data.frame(x1_train),
+  		# y.train = y1_train,
+  		# mc.cores=7
+	# )
+		
+	brt_p1 = BART::mc.wbart(
+		x.train = x1_train,
+		y.train = y1_train,
+		mc.cores=7
+	)
+
+	brt_p2 = BART::mc.wbart(
+		x.train = x1_train,
+		y.train = y1_train,
+		sparse=TRUE,
+		mc.cores=7
+	)
+		
+	# predict
+	pred1 = apply(predict(brt_p1, x_valid), 2, mean)
+	pred2 = apply(predict(brt_p2, x_valid), 2, mean)
+	
+    # define output object to be returned as list (for flexibility)
+    out <- list(
+		# p1 = data.frame("truth" = valid_data$nonzero_expend, "est" = pred1),
+		final = data.frame("truth" = valid_data$expend, "est1" = pred1, "est2" = pred2)
+    )
+}
+
+# folds_1 <- make_folds(train, fold_fun  = folds_vfold, V=2)
+cvtbart2_results <- cross_validate(
+  cv_fun = cv_bart2, 
+  folds = folds,
+  data = train_bart, 
+  use_future = FALSE
+)
+# cvtbart_results$p1
+# str(cvtbart2_results)
+
+# yardstick::roc_auc(cvtbart2_results$p1, "truth", "est", event_level = "second")
+# yardstick::pr_auc(cvtbart2_results$p1, "truth", "est", event_level = "second")
+yardstick::rmse(cvtbart2_results$final, "truth", "est1")
+yardstick::rsq(cvtbart2_results$final, "truth", "est1")
+yardstick::rmse(cvtbart2_results$final, "truth", "est2")
+yardstick::rsq(cvtbart2_results$final, "truth", "est2")
+cvtbart2_results$final
+
+cvtbart_results$final
+```
+
+# all results
+```{r}
+cvtpm_results$final
+cvtrf_results$final
+cvtbart_results$final
+cvtbart2_results$final
+
+results = tibble(
+	"true" = cvtpm_results$final$truth,
+	"tpm" = cvtpm_results$final$est,
+	"rf" = cvtrf_results$final$est,
+	"brt_tpm" = cvtbart_results$final$est,
+	"brt" = cvtbart2_results$final$est1,
+	"brt_sprs" = cvtbart2_results$final$est2
+)
+
+write.csv(results, "cv_results.csv")
+
+
+ms = yardstick::metric_set(rmse, rsq)
+library(tidyr)
+results %>% glimpse
+results %>% 
+	pivot_longer(cols= c("tpm", "rf", "brt_tpm", "brt", "brt_sprs"), names_to = "mod", values_to = "vals") %>% 
+	group_by(mod) %>% 
+	# glimpse
+	ms(true, vals)
+# cvtrf_results$final
+
+with(results, plot(tpm, true))
+with(results, plot(brt,true))
+with(results, plot(tpm, rf))
+with(results, plot(tpm, brt))
+with(results, plot(tpm, brt))
+```
+
+# ATT BART
+```{r}
+# get preds for att for bart and tpm
+cov_names = unlist(str_trim(unlist(str_split("asthma_treated+ sex + age + agesq + income + educ + race + insurance + married + region", "\\+"), "both")))
+x1_train = data %>% select(cov_names) %>% 
+	mutate(
+  		asthma_treated = factor(asthma_treated),
+  		sex = factor(sex),
+  		educ = factor(educ),
+  		race = factor(race),
+  		insurance = factor(insurance),
+  		married = factor(married),
+  		region = factor(region)
+	)
+y1_train = data$expend 
+x_asth = subset(x1_train, asthma_treated==1)
+n_asth = nrow(x_asth)
+x_asth_cf = bind_rows(x_asth, x_asth)
+x_asth_cf$asthma_treated = factor(c(rep(1, n_asth), rep(0, n_asth)))
+x_asth_cf = BART::bartModelMatrix(x_asth_cf)
+x_asth_cf %>% glimpse
+
+
+
+# train
+brt_p1 = BART::mc.wbart(
+	x.train = x1_train,
+	y.train = y1_train,
+	mc.cores=7
+)
+# predict
+pred_asth =  predict(brt_p1, x_asth_cf)
+pred_asth2 = apply(pred_asth, 2, mean)
+# pred_asth2[1:n_asth]
+bart_att_raw =pred_asth2[1:n_asth] - pred_asth2[(n_asth+1):(n_asth*2)]
+bart_att_mn = mean(bart_att_raw)
+```
+
+# ATT tpm
+```{r}
+# tpm
+tp_model <- tpm(
+  expend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region,
+  data = data,
+  link_part1 = "logit",
+  family_part2 = Gamma(link = "log"),
+#   weights= data$PERWTF
+)
+base_data <- subset(data,asthma_treated==1)
+counterfactual_data <- base_data
+counterfactual_data$asthma_treated <- 0
+base_prediction <- predict(tp_model, newdata = base_data)
+counterfactual_prediction <- predict(tp_model, newdata = counterfactual_data)
+tpm_glm_raw <-base_prediction - counterfactual_prediction
+mae_tpm_glm = mean(tpm_glm_raw)
+mae_tpm_glm
+
+# join with bart
+att_results = tibble(
+	bart = bart_att_raw,
+	tpm = tpm_glm_raw
+) %>% glimpse
+
+apply(att_results, 2, mean)
+
+plot(att_results$bart, att_results$tpm, xlim=c(0,10000), ylim=c(0,10000))
+cor(att_results$bart, att_results$tpm) ^2
+```
+
+# PDP
+```{r}
+# pdp
+x1_train %>% glimpse
+pdp1 = bind_rows(x_asth, x_asth)
+pdp1$asthma_treated = factor(c(rep(1,n_asth), rep(0,n_asth)))
+pdp1 %>% glimpse
+pdp2 = bind_rows()
+
+# builds a pdp dataset
+pdp_build = function(df, var, val, sample_n = 0, seed = 0) {
+	n = nrow(df)
+	if (seed != 0){
+		set.seed(seed)
+	}
+	if(sample_n != 0){
+		smp = sample(seq(1,n), sample_n)
+		df = df[smp,]
+	}
+	val_out = c()
+	df_out = data.frame()
+	n = nrow(df)
+	for(v in val){
+		val_out = append(val_out, rep(v, n))
+		df_out = bind_rows(df_out, df)
+	}
+	if(class(df[[var]]) == "factor"){
+		val_out = factor(val_out)
+	}
+	df_out[var] = val_out
+	return(df_out)
+}
+
+# runs pdp bart
+# idx_class indicates the covariate combo in each row
+# pred is rowwise aligned with idx_class
+pdp_run = function(bart_post, df, var, val, sample_n = 0, seed = 0){
+	pdp_df = pdp_build(df, var=var, val=val, sample_n, seed)
+	# hardcode asthma treated
+	idx = pdp_df %>% select(asthma_treated, var) %>% unique
+	pdp_df = BART::bartModelMatrix(pdp_df)
+	str(pdp_df)
+	pred_pdp = predict(bart_post, pdp_df)
+
+	nrows = as.numeric(rownames(idx))[2]-1# gets number of observations in set
+	ncols = nrow(idx)
+	pred = apply(pred_pdp, 2, mean) # reduce predicitons
+	pred = t(matrix(pred, nrow=nrows, ncol = ncols))
+	return(list(
+		"idx_class" = idx,
+		"idx" = as.numeric(rownames(idx)),
+		"pred" = pred
+		)
+	)
+}
+
+
+# married
+{
+	lvls = levels(pdp1$married)
+	pdp2 = pdp_run(brt_p1, pdp1.1, var="married", lvls)
+	# difference in asthma in the within the married vs unmaried
+	pdp_married = c(
+		mean(pdp2$pred[1,] - pdp2$pred[2,]),
+		mean(pdp2$pred[3,] - pdp2$pred[4,])
+	)
+	names(pdp_married) = lvls
+}
+
+
+# age
+{
+	skim(pdp1.1$age)
+	hist(pdp1.1$age)
+	pdp2 = pdp_run(brt_p1, pdp1.1, var="age", c(0, 5,10, 15, 20, 35, 55, 85))
+	pdp2$idx_class
+	pdp_age = c(
+		mean(pdp2$pred[1,] - pdp2$pred[2,]),
+		mean(pdp2$pred[3,] - pdp2$pred[4,]),
+		mean(pdp2$pred[5,] - pdp2$pred[6,]),
+		mean(pdp2$pred[7,] - pdp2$pred[8,]),
+		mean(pdp2$pred[9,] - pdp2$pred[10,]),
+		mean(pdp2$pred[11,] - pdp2$pred[12,]),
+		mean(pdp2$pred[13,] - pdp2$pred[14,]),
+		mean(pdp2$pred[15,] - pdp2$pred[16,])
+	)
+	names(pdp_age) = as.character(c(0, 5,10, 15, 20, 35, 55, 85))
+}
+pdp_age
+
+# agesqr
+{	
+	# hist(pdp1.1$agesq)
+	pdp2 = pdp_run(brt_p1, pdp1.1, var="agesq", c(0,5,10,15, 20, 35, 55, 85)^2)
+	pdp_agesq = c(
+		mean(pdp2$pred[1,] - pdp2$pred[2,]),
+		mean(pdp2$pred[3,] - pdp2$pred[4,]),
+		mean(pdp2$pred[5,] - pdp2$pred[6,]),
+		mean(pdp2$pred[7,] - pdp2$pred[8,]),
+		mean(pdp2$pred[9,] - pdp2$pred[10,]),
+			mean(pdp2$pred[11,] - pdp2$pred[12,]),
+		mean(pdp2$pred[13,] - pdp2$pred[14,]),
+		mean(pdp2$pred[15,] - pdp2$pred[16,])
+	)
+	names(pdp_agesq) = as.character(c(0, 5,10, 15, 20, 35, 55, 85))
+}
+pdp_agesq
+
+
+# sex
+{
+	# pdp1 %>% glimpse
+	pdp2 = pdp_run(brt_p1, pdp1.1, var="sex", c("0","1"))
+	pdp2$idx_class
+	pdp_sex = c(
+		mean(pdp2$pred[1,] - pdp2$pred[2,]),
+		mean(pdp2$pred[3,] - pdp2$pred[4,])
+		# mean(pdp2$pred[5,] - pdp2$pred[6,]),
+		# mean(pdp2$pred[7,] - pdp2$pred[8,]),
+		# mean(pdp2$pred[9,] - pdp2$pred[10,])
+	)
+	names(pdp_sex) = c("0","1")
+	pdp_sex
+}
+
+#income
+{
+	# unique(pdp1$income)
+	pdp2 = pdp_run(brt_p1, pdp1.1, var="income", c(1,2,3,4,5))
+	pdp_income = c(
+		mean(pdp2$pred[1,] - pdp2$pred[2,]),
+		mean(pdp2$pred[3,] - pdp2$pred[4,]),
+		mean(pdp2$pred[5,] - pdp2$pred[6,]),
+		mean(pdp2$pred[7,] - pdp2$pred[8,]),
+		mean(pdp2$pred[9,] - pdp2$pred[10,])
+	)
+	names(pdp_income) = c(1,2,3,4,5)
+	pdp_income
+}
+
+#educ
+{	
+	lvls = levels(pdp1$educ)
+	pdp2 = pdp_run(brt_p1, pdp1.1, var="educ", lvls)
+	pdp_educ = c(
+		mean(pdp2$pred[1,] - pdp2$pred[2,]),
+		mean(pdp2$pred[3,] - pdp2$pred[4,]),
+		mean(pdp2$pred[5,] - pdp2$pred[6,]),
+		mean(pdp2$pred[7,] - pdp2$pred[8,]),
+		mean(pdp2$pred[9,] - pdp2$pred[10,])
+	)
+	names(pdp_educ) = lvls
+	pdp_educ
+}
+
+
+#race
+{
+	lvls = levels(pdp1$race)
+	pdp2 = pdp_run(brt_p1, pdp1.1, var="race", lvls)
+	pdp_race = c(
+		mean(pdp2$pred[1,] - pdp2$pred[2,]),
+		mean(pdp2$pred[3,] - pdp2$pred[4,]),
+		mean(pdp2$pred[5,] - pdp2$pred[6,]),
+		mean(pdp2$pred[7,] - pdp2$pred[8,]),
+		mean(pdp2$pred[9,] - pdp2$pred[10,])
+	)
+	names(pdp_race) = lvls
+	pdp_race
+}
+
+#insurance
+
+{
+	lvls = levels(pdp1$insurance)
+	pdp2 = pdp_run(brt_p1, pdp1.1, var="insurance", lvls)
+	pdp_insurance = c(
+		mean(pdp2$pred[1,] - pdp2$pred[2,]),
+		mean(pdp2$pred[3,] - pdp2$pred[4,]),
+		mean(pdp2$pred[5,] - pdp2$pred[6,]),
+		mean(pdp2$pred[7,] - pdp2$pred[8,])
+	)
+	names(pdp_insurance) = lvls
+	pdp_insurance
+}
+
+#region
+{
+	lvls = levels(pdp1$region)
+	pdp2 = pdp_run(brt_p1, pdp1.1, var="region", lvls)
+	pdp_region = c(
+		mean(pdp2$pred[1,] - pdp2$pred[2,]),
+		mean(pdp2$pred[3,] - pdp2$pred[4,]),
+		mean(pdp2$pred[5,] - pdp2$pred[6,]),
+		mean(pdp2$pred[7,] - pdp2$pred[8,]),
+		mean(pdp2$pred[9,] - pdp2$pred[10,])
+	)
+	names(pdp_region)= lvls
+	pdp_region
+}
+
+pdp_results = tibble(
+	"var" = "married",
+	"lvl" = list(names(pdp_married)),
+	"att" = list(pdp_married)
+	) %>% unnest(c(lvl, att)) %>% 
+	bind_rows(
+		tibble(
+		"var" = "age",
+		"lvl" = list(names(pdp_age)),
+		"att" = list(pdp_age)
+		) %>% unnest(c(lvl, att))
+	) %>% 
+	bind_rows(
+		tibble(
+		"var" = "agesq",
+		"lvl" = list(names(pdp_agesq)),
+		"att" = list(pdp_agesq)
+		) %>% unnest(c(lvl, att))
+	) %>% 
+	bind_rows(
+		tibble(
+		"var" = "sex",
+		"lvl" = list(names(pdp_sex)),
+		"att" = list(pdp_sex)
+		) %>% unnest(c(lvl, att))
+	) %>% 
+	bind_rows(
+		tibble(
+		"var" = "income",
+		"lvl" = list(names(pdp_income)),
+		"att" = list(pdp_income)
+		) %>% unnest(c(lvl, att))
+	) %>% 
+	bind_rows(
+		tibble(
+		"var" = "educ",
+		"lvl" = list(names(pdp_educ)),
+		"att" = list(pdp_educ)
+		) %>% unnest(c(lvl, att))
+	) %>% 
+	bind_rows(
+		tibble(
+		"var" = "race",
+		"lvl" = list(names(pdp_race)),
+		"att" = list(pdp_race)
+		) %>% unnest(c(lvl, att))
+	) %>% 
+	bind_rows(
+		tibble(
+		"var" = "insurance",
+		"lvl" = list(names(pdp_insurance)),
+		"att" = list(pdp_insurance)
+		) %>% unnest(c(lvl, att))
+	) %>% 
+	bind_rows(
+		tibble(
+		"var" = "region",
+		"lvl" = list(names(pdp_region)),
+		"att" = list(pdp_region)
+		) %>% unnest(c(lvl, att))
+	) 
+
+glimpse(pdp_results)
+write.csv(pdp_results, "pdp_results.csv")
+```
+
+```{r}
+library(ggplot2)
+
+pdp_results %>% glimpse
+
+gg = pdp_results %>% 
+	mutate(var_lvl = paste0(var, "_",lvl)) %>% 
+	group_by(var) %>% 
+	arrange(var, att) %>% 
+	ggplot(aes(x = att, y = var_lvl, col = var)) +
+	geom_point(size=2)
+
+ggsave("pdp_1.png", gg)
+
+```
