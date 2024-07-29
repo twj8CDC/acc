@@ -17,6 +17,7 @@ library(ranger)
 
 ```{r}
 data <- read.csv("meps_2012_clean.csv")
+glimpse(data)
 data$nonzero_expend = as.factor(ifelse(data$expend > 0, 1,0))
 data %>% glimpse()
 

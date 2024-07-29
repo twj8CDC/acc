@@ -1,0 +1,455 @@
+library(MEPS)
+library(dplyr)
+library(survey)
+
+# Function to read MEPS data
+read_meps_data <- function(year, types) {
+  data_list <- list()
+  for (type in types) {
+    data_list[[type]] <- read_MEPS(year = year, type = type)
+  }
+  return(data_list)
+}
+
+# Function to select conditions related to asthma (ICD-9 code 493)
+asthma_conditions <- function(df) {
+  if ("ICD9CODX" %in% colnames(df)) {
+    df <- df %>% filter(grepl("493", ICD9CODX))
+  }
+  if ("ICD10CDX" %in% colnames(df)) {
+    df <- df %>% filter(grepl("J45", ICD10CDX))
+  }
+  df %>% mutate(Condition = "Asthma")
+}
+
+# Function to merge each event file with the Condition Event Link file and then with the Condition file
+merge_conditions <- function(event_df, link_df, condition_df) {
+  event_df %>%
+    left_join(link_df, by = c("DUPERSID", "EVNTIDX")) %>%
+    left_join(condition_df, by = "CONDIDX") %>%
+    asthma_conditions()
+}
+
+# Function to process data for a single year
+process_year <- function(year) {
+  data <- read_meps_data(year, c("RX", "DV", "IP", "ER", "OP", "OB", "HH", "COND", "CLNK"))
+  
+  # Rename column for RX dataset
+  data$RX <- data$RX %>% rename(EVNTIDX = "LINKIDX")
+  
+  # Apply merge_conditions function to the relevant datasets
+  event_types <- c("RX", "IP", "ER", "OP", "OB", "HH")
+  merged_data <- bind_rows(lapply(event_types, function(type) {
+    merge_conditions(data[[type]], data$CLNK, data$COND)
+  }))
+  
+  # Extract unique DUPERSID for asthma-related conditions with the year
+  asthma_DUPERSID <- merged_data %>%
+    filter(!is.na(Condition)) %>%
+    distinct(DUPERSID.y) %>%
+    mutate(Year = year) %>%
+    rename(DUPERSID = DUPERSID.y)
+  
+  return(asthma_DUPERSID)
+}
+
+# Specify the years of interest
+years <- c(2012)
+
+# Process data for all specified years and combine the results
+all_years_data <- bind_rows(lapply(years, function(year) {
+  process_year(year)
+}))
+
+# Function to rename weight variable and adjust weight
+rename_and_adjust_weights <- function(fyc, year) {
+  weight_var <- paste0("PERWT", substr(year, 3, 4), "F")
+  fyc %>%
+    rename(PERWTF = !!sym(weight_var)) %>%
+    mutate(adjusted_PERWTF = PERWTF / length(unique(fyc$Year)))
+}
+
+# Load FYC (Full-Year Consolidated) files, pool data over the specified years, and adjust weights
+fyc_data_list <- lapply(years, function(year) {
+  fyc <- read_MEPS(year = year, type = "FYC")
+  fyc <- fyc %>% mutate(Year = year)
+  rename_and_adjust_weights(fyc, year)
+})
+
+# Combine the FYC data for all years
+fyc_pooled <- bind_rows(fyc_data_list)
+rm(fyc_data_list)
+# Create the asthma_treated variable by performing a left join with indicator
+# maybe there is a better way to do this, will look into it more later.
+fyc_pooled <- fyc_pooled %>%
+  left_join(all_years_data %>% mutate(asthma_treated = 1), by = c("DUPERSID", "Year")) %>%
+  mutate(asthma_treated = ifelse(is.na(asthma_treated), 0, asthma_treated))
+
+
+condition<-read_MEPS(year=2012, type="COND")
+data <- condition %>%
+  mutate(
+    mi = ifelse(ICD9CODX %in% c("410", "412"), 1, 0),
+    chf = ifelse(ICD9CODX %in% c("398", "402", "404", "425", "428"), 1, 0),
+    pvd = ifelse(ICD9CODX %in% c("093", "437", "440", "441", "443", "447", "557", "V43"), 1, 0),
+    cevd = ifelse(ICD9CODX %in% c("362", "430", "431", "432", "433", "434", "436", "437", "438"), 1, 0),
+    dementia = ifelse(ICD9CODX %in% c("290", "294", "331"), 1, 0),    
+    cpd = ifelse(ICD9CODX %in% c("416", "490", "491", "492", "494", "495", "496", "497", "498", "499", "500", "501", "502", "503", "504", "505", "506", "508"), 1, 0), 
+    rheum = ifelse(ICD9CODX %in% c("446", "710", "714", "725"), 1, 0),
+    pud = ifelse(ICD9CODX %in% c("531", "532", "533", "534"), 1, 0),    
+    mld = ifelse(ICD9CODX %in% c("070", "570", "571", "573", "V42"), 1, 0),
+    diab = ifelse(ICD9CODX %in% c("250"), 1, 0),
+    diabwc = ifelse(ICD9CODX %in% c("250.4", "250.5", "250.6", "250.7"), 1, 0),
+    hp = ifelse(ICD9CODX %in% c("334", "342", "343", "344"), 1, 0),
+    rend = ifelse(ICD9CODX %in% c("403", "404", "582", "583", "585", "586", "V42", "V45", "V56"), 1, 0),    
+    canc = ifelse(ICD9CODX %in% c("140", "141", "142", "143", "144", "145", "146", "147", "148", "149", "150", "151", "152", "153", "154", "155", "156", "157", "158", "159", "160", "161", "162", "163", "164", "165", "166", "167", "168", "169", "170", "171", "172", "174", "175", "176", "177", "178", "179", "180", "181", "182", "183", "184", "185", "186", "187", "188", "189", "190", "191", "192", "193", "194", "195", "200", "201", "202", "203", "204", "205", "206", "207", "208", "238"), 1, 0),    
+    msld = ifelse(ICD9CODX %in% c("456", "572"), 1, 0),
+    metacanc = ifelse(ICD9CODX %in% c("196", "197", "198", "199"), 1, 0),
+    aids = ifelse(ICD9CODX %in% c("042", "043", "044"), 1, 0)
+  ) %>%
+  group_by(DUPERSID) %>%
+  summarise(
+    CCI = sum(mi, chf, pvd, cevd, dementia, rheum, cpd, pud, mld, diab) + 
+      2 * sum(diabwc, hp, rend, canc) +
+      3 * sum(msld) +
+      6 * sum(metacanc, aids),
+    mi = max(mi),
+    chf = max(chf),
+    pvd = max(pvd),
+    cevd = max(cevd),
+    dementia = max(dementia),
+    cpd = max(cpd),
+    rheum = max(rheum),
+    pud = max(pud),
+    mld_liver = max(mld),
+    diab = max(diab),
+    diabwc = max(diabwc),
+    hemiplegia = max(hp),
+    rend = max(rend),
+    cancer = max(canc),
+    ms_liver = max(msld),
+    metacanc = max(metacanc),
+    aids = max(aids),
+    
+    .groups = 'drop'
+  )
+
+
+
+small_fyc<-fyc_pooled%>%
+  mutate(
+    expend=TOTEXP12,
+    age=AGE12X,
+    sex=SEX,
+    race=RACETHX,
+    married=ifelse(MARRY12X==1,1,0),
+    income=POVCAT12,
+    region=REGION12,
+    insurance=case_when(
+      MCAID12X == 1 ~ "Medicaid",
+      MCARE12X == 1 ~ "Medicare",
+      INSCOV12 == 1 ~ "Private",
+      INSCOV12 == 3 ~ "Uninsured",
+      TRUE~ NA_character_),
+    educ=case_when(
+      EDRECODE %in% c(0:12) ~ "LessHS",
+      EDRECODE %in% c(13) ~ "HS",
+      EDRECODE %in% c(14,15) ~ "College",
+      EDRECODE  %in% c(16) ~ "Advanced",
+      EDRECODE == -1 ~ "Child5",
+      TRUE~ NA_character_)
+    
+  ) %>% 
+  select(DDNWRK31,DUPERSID,asthma_treated,VARPSU,VARSTR,PERWTF,expend,age,sex,race,married,income,region,insurance,educ)
+
+small<-small_fyc%>%left_join(data)
+
+
+library(twopartm)
+library(tidyr) #for replace_na
+
+data<-small
+data<-data%>%replace_na(list(CCI=0))
+data<-data%>%mutate(zero_miss_work=ifelse(DDNWRK31==0,1,0))
+
+# Filter out missing values in the relevant column
+# tidyr for replace_na
+data <- data[!is.na(data$expend), ]
+data$agesq<-(data$age)^2
+data<-data%>%mutate(across(c(sex,race,married,income,region,insurance,educ), as.factor))
+data<-data%>%replace_na(list(mi=0,chf=0,pvd=0,cevd=0,dementia=0,cpd=0,rheum=0,pud=0,mld_liver=0,diab=0,
+                             diabwc=0,hemiplegia=0,rend=0,cancer=0,ms_liver=0,metacanc=0,aids=0))
+data<-data%>%filter(!is.na(insurance),!is.na(educ))
+
+
+tp_model <- tpm(
+  expend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region,
+  data = data,
+  link_part1 = "logit",
+  family_part2 = Gamma(link = "log")
+)
+
+
+
+tp_model <- tpm(
+  expend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region,
+  data = data,
+  link_part1 = "logit",
+  family_part2 = Gamma(link = "log"),weights=data$PERWTF
+)
+
+#general prediction
+full_data<-data
+full_data$pred_glm<-predict(tp_model, full_data)
+
+# Calculate the incremental effect of asthma_treated
+base_data <- subset(data,asthma_treated==1)
+counterfactual_data <- base_data
+counterfactual_data$asthma_treated <- 0
+
+
+
+base_prediction <- predict(tp_model, newdata = base_data)
+counterfactual_prediction <- predict(tp_model, newdata = counterfactual_data)
+
+# Calculate incremental cost
+mae <- mean(base_prediction - counterfactual_prediction)
+
+
+
+# Load necessary libraries
+library(ranger)
+library(tidyr) #for replace_na
+library(dplyr) # for data manipulation
+
+
+
+
+# Create binary outcome for the first part of the model
+data$nonzero_expend <- as.factor(ifelse(data$expend > 0, 1, 0))
+
+
+
+#Fit Random Forest for the first part (classification) using ranger
+#No Weights Case
+rf_part1 <- ranger(nonzero_expend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region,
+                   data = data, num.trees = 1500,
+                   probability = TRUE)
+
+#With Weights
+rf_part1 <- ranger(nonzero_expend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region,
+                   data = data, case.weights=data$PERWTF,
+                   num.trees = 1500,
+                   probability = TRUE)
+
+# Fit Random Forest for the second part (regression on non-zero expenditures) using ranger
+
+#No Weights
+rf_part2 <- ranger(expend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region,
+                   data = subset(data, nonzero_expend == 1), num.trees = 1500)
+
+#With Weights
+rf_part2 <- ranger(expend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region,
+                   data = subset(data, nonzero_expend == 1), case.weights=data%>%filter(nonzero_expend==1)%>%select(PERWTF),
+                   num.trees = 1500)
+
+#pred on full data
+full_data$prob_nonzero <- predict(rf_part1, full_data)$predictions[, 2]
+full_data$pred_expend <- predict(rf_part2, full_data)$predictions
+full_data$expected_expend <- round(full_data$prob_nonzero) * full_data$pred_expend
+
+# Calculate incremental effect of asthma_treated
+base_data <- subset(data, asthma_treated == 1)
+counterfactual_data <- base_data
+counterfactual_data$asthma_treated <- 0
+
+
+#example, to generate incremental cost for AL, Females, 18-44, Private Health Insurance
+# base data, where sex=F, age=1844, insurance=Private, subset data where asthma==1
+#counterfactual is the same as above except asthma ==0
+# using the adjustment factor, I'll multiply the above by AL coefficient
+
+
+# Predict for base and counterfactual scenarios
+base_data$prob_nonzero <- predict(rf_part1, base_data)$predictions[, 2]
+base_data$pred_expend <- predict(rf_part2, base_data)$predictions
+base_data$expected_expend <- round(base_data$prob_nonzero) * base_data$pred_expend
+
+counterfactual_data$prob_nonzero <- predict(rf_part1, counterfactual_data)$predictions[, 2]
+counterfactual_data$pred_expend <- predict(rf_part2, counterfactual_data)$predictions
+counterfactual_data$expected_expend <- round(counterfactual_data$prob_nonzero) * counterfactual_data$pred_expend
+
+
+######
+#LOGIC
+# 1. Model Trained Properly to weight information in the sample data
+# 2. 'new' sample is used to get predictions -> are accurate in terms of 'coefs'
+# 3. Hypothesis like statement or generalization to the population, we may 
+# have to use the weights in the 'new' sample
+
+#calculated individual treatment effect on treated
+difference<-base_data$expected_expend - counterfactual_data$expected_expend
+
+weights<-base_data$PERWTF/sum(base_data$PERWTF)
+weighted_att<-sum(difference*weights)
+
+# Calculate incremental cost
+mae <- mean(base_data$expected_expend - counterfactual_data$expected_expend)
+
+# Print the incremental cost
+print(mae)
+
+
+
+# 
+# small$itt<-ifelse(small$asthma_treated==1,difference,0)
+# svydata<-svydesign(
+#   id = ~VARPSU,
+#   strata = ~VARSTR,
+#   weights = ~PERWTF,
+#   data = small,
+#   nest = TRUE)
+# 
+# best_att<-svyby(~itt,~asthma_treated+sex+race,svymean,design=svydata,na.rm=T)
+
+
+
+
+
+
+
+
+
+
+
+##### MISSED WORK DAYS MODELING
+# Load necessary libraries
+library(MASS)
+library(pscl)
+
+data<-subset(data,DDNWRK31>=0)
+data$nonzero_days <- ifelse(data$DDNWRK31 > 0, 1, 0)
+
+# Fit a negative binomial regression model
+nb_model <- glm.nb(DDNWRK31 ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region, data = data)
+
+# Display the summary of the negative binomial model
+summary(nb_model)
+
+# Fit a zero-inflated negative binomial regression model
+zinb_model <- zeroinfl(DDNWRK31 ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region|  asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region, data = data, dist = "negbin")
+
+
+# Compare BIC values
+nb_bic <- BIC(nb_model)
+zinb_bic <- BIC(zinb_model)
+
+
+
+
+# Calculate the incremental effect of asthma_treated
+base_data <- subset(data,asthma_treated==1)
+counterfactual_data <- base_data
+counterfactual_data$asthma_treated <- 0
+
+
+
+base_prediction <- predict(nb_model, newdata = base_data,type="response")
+counterfactual_prediction <- predict(nb_model, newdata = counterfactual_data,type="response")
+
+# Calculate incremental effect
+work_mae <- mean(base_prediction - counterfactual_prediction)
+
+
+
+
+
+
+
+###
+#1. Data Part <Pooling, Cleaning, etc>
+#2. Modeling
+#3. Prediction/ATTs and EVERYTHING ELSE
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+########### NOW, WE DO THE RF with SAMPLING WITH REPLACEMENT (a la bootrstrap) APPROACH#########
+
+# Create binary outcome for the first part of the model
+data$nonzero_expend <- as.factor(ifelse(data$expend > 0, 1, 0))
+
+# Define function to train models and calculate MAE for a sample
+calculate_mae <- function(sampled_data) {
+  # Fit Random Forest for the first part (classification) using ranger
+  rf_part1 <- ranger(nonzero_expend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region, 
+                     data = sampled_data, 
+                     num.trees = 500, 
+                     probability = TRUE)
+  
+  # Fit Random Forest for the second part (regression on non-zero expenditures) using ranger
+  rf_part2 <- ranger(expend ~ asthma_treated + sex + age + agesq + income + educ + race + insurance + married + region, 
+                     data = subset(sampled_data, nonzero_expend == 1), 
+                     num.trees = 500)
+  
+  # Calculate incremental effect of asthma_treated
+  base_data <- subset(sampled_data, asthma_treated == 1)
+  counterfactual_data <- base_data
+  counterfactual_data$asthma_treated <- 0
+  
+  # Predict for base and counterfactual scenarios
+  base_data$prob_nonzero <- predict(rf_part1, base_data)$predictions[, 2]
+  base_data$pred_expend <- predict(rf_part2, base_data)$predictions
+  base_data$expected_expend <- base_data$prob_nonzero * base_data$pred_expend
+  
+  counterfactual_data$prob_nonzero <- predict(rf_part1, counterfactual_data)$predictions[, 2]
+  counterfactual_data$pred_expend <- predict(rf_part2, counterfactual_data)$predictions
+  counterfactual_data$expected_expend <- counterfactual_data$prob_nonzero * counterfactual_data$pred_expend
+  
+  # Calculate incremental cost
+  mae <- mean(base_data$expected_expend - counterfactual_data$expected_expend)
+  
+  return(mae)
+}
+
+# Generate 100 samples and calculate MAE values
+set.seed(123)
+mae_values <- numeric(100)
+
+for (i in 1:100) {
+  sampled_data <- data[sample(nrow(data), size = nrow(data), replace = TRUE, prob = data$PERWTF), ]
+  mae_values[i] <- calculate_mae(sampled_data)
+}
+
+# Print the MAE values
+print(mean(mae_values))
